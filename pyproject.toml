@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aprovacoes-dou"
+version = "0.1.0"
+description = "Extração e geração das revistas de aprovações de agrotóxicos do DOU"
+requires-python = ">=3.11"
+dependencies = [
+  "deep-translator>=1.11",
+  "openpyxl>=3.1",
+  "pandas>=2.1",
+]
+
+[project.scripts]
+aprovacoes = "aprovacoes.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

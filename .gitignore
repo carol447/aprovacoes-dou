@@ -1,0 +1,21 @@
+# Ambientes e dependências locais
+.venv/
+venv/
+node_modules/
+.tools/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Resultados e caches regeneráveis
+outputs/
+*.log
+
+# Arquivos temporários do sistema/editor
+.DS_Store
+Thumbs.db
+~$*
+*.tmp
