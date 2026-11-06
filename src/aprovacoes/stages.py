@@ -7,10 +7,15 @@ from pathlib import Path
 import pandas as pd
 
 from .agrofit import download_database, enrich
-from .export import write_xlsx
+from .export import biological_rows, write_xlsx
 from .models import ApprovalRecord, ProductType
 from .parser import detect_product_type, parse
-from .rules import apply_business_rules, technical_product_without_concentration
+from .rules import (
+    CONCENTRATION_RE, FORMULATION_RE, apply_business_rules, capitalize_product,
+    formulated_product_from_brand, normalize_formulated_product, remove_product_parentheses, remove_product_strain,
+    split_product_ingredients,
+    technical_product_without_concentration,
+)
 from .text import clean_space
 from .translations import Translator
 
@@ -47,13 +52,15 @@ def extract_act(
     records = parse(text, product_type)
     if not records:
         raise ValueError("Nenhum bloco de registro foi encontrado no ato")
-    records = [apply_business_rules(record, product_type) for record in records]
     if agrofit_csv is None and download_agrofit:
         agrofit_csv = download_database(product_type, output_path.parent / "cache")
     if agrofit_csv is not None:
         enrich(records, product_type, agrofit_csv)
-        records = [apply_business_rules(record, product_type) for record in records]
-    write_xlsx([record.operational_row(product_type) for record in records], output_path)
+    records = [apply_business_rules(record, product_type) for record in records]
+    write_xlsx(
+        [record.operational_row(product_type) for record in records], output_path,
+        italic_products={index for index, record in enumerate(records) if record.biologico},
+    )
     return output_path
 
 
@@ -77,7 +84,10 @@ def _control_from_operational(input_path: Path, product_type: ProductType) -> pd
             "nota_en": "",
             "nota_cn": "",
             "fabricante_produto": source["Fabricante do produto técnico"],
-            "produto_pt": source["Produto"],
+            "produto_pt": [
+                normalize_formulated_product(product, brand)
+                for product, brand in zip(source["Produto"], source["Marca comercial"])
+            ],
             "produto_en": "",
             "produto_cn": "",
             "registro": source["Registro"],
@@ -115,33 +125,30 @@ def translate_extraction(
         control["recomendacao_uso_en"] = control["recomendacao_uso_pt"].map(lambda value: translator.use(value, "en"))
         control["recomendacao_uso_cn"] = control["recomendacao_uso_pt"].map(lambda value: translator.use(value, "cn"))
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    control.to_excel(output_path, index=False)
+    write_xlsx(control, output_path, italic_products=biological_rows(input_path, "Produto"))
     pending_path = output_path.with_name(f"{output_path.stem}_pendencias.json")
+    pending = {"termos_sem_traducao": sorted(item for item in translator.missing if item)}
+    if product_type is ProductType.FORMULADO:
+        pending["formulados_sem_concentracao"] = [
+            {"registro": row.registro, "marca": row.marca_comercial}
+            for row in control.itertuples()
+            if any(not CONCENTRATION_RE.search(part) for part in split_product_ingredients(row.produto_pt))
+        ]
     pending_path.write_text(
-        json.dumps({"termos_sem_traducao": sorted(item for item in translator.missing if item)}, ensure_ascii=False, indent=2),
+        json.dumps(pending, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return output_path, pending_path
 
 
-CONCENTRATION_RE = re.compile(
-    r"\d+(?:[.,]\d+)?\s*(?:g|kg|mg|mL|L|UFC|UI|indiv[ií]duos?)\s*/\s*(?:g|kg|mL|L)", re.I
-)
-FORMULATION_RE = re.compile(r"\b(SC|SL|EC|WG|WP|CS|OD|FS|EW|GR|ME|SP|SG|SE)\b", re.I)
-
-
-def _product_parts(value: str) -> tuple[list[str], list[str], str]:
-    value = clean_space(value)
-    concentrations = CONCENTRATION_RE.findall(value)
-    # findall com grupo retorna só o grupo em algumas regex; use finditer para o texto integral.
-    concentrations = [match.group(0) for match in CONCENTRATION_RE.finditer(value)]
-    values = [re.search(r"\d+(?:[.,]\d+)?", item).group(0) for item in concentrations]
-    formulations = FORMULATION_RE.findall(value)
-    formulation = formulations[-1].upper() if formulations else ""
+def _product_parts(value: str, formulation_field: str = "") -> tuple[list[str], str]:
+    value = remove_product_strain(remove_product_parentheses(clean_space(value)))
+    concentrations = list(CONCENTRATION_RE.finditer(value))
+    formulations = FORMULATION_RE.findall(value) or FORMULATION_RE.findall(formulation_field)
+    formulation = " ".join(dict.fromkeys(code.upper() for code in formulations))
     names = CONCENTRATION_RE.sub("", value)
+    names = re.sub(rf"\s+{FORMULATION_RE.pattern}\s+-\s+.*$", "", names, flags=re.I)
     names = FORMULATION_RE.sub("", names)
-    names = re.sub(r"\([^)]*\d[^)]*\)", "", names)
-    names = re.sub(r"\(\s*\)", "", names)
     names = re.sub(
         r"\s*-\s*(?:Suspo-Emuls[aã]o|Concentrado Emulsion[aá]vel|P[oó] Molh[aá]vel|"
         r"Suspens[aã]o Concentrada(?:\s+p/\s*Trat\.\s*Sementes)?|Dispers[aã]o de [oó]leo|"
@@ -150,12 +157,21 @@ def _product_parts(value: str) -> tuple[list[str], list[str], str]:
         names,
         flags=re.I,
     )
+    names = re.sub(r"\s+(?:Insetos|[ÁA]caros|Nemat[oó]ides)\s+vivos\s*$", "", names, flags=re.I)
     parts = [clean_space(part).strip(" ,;+-") for part in re.split(r"\s*(?:\+|;)\s*", names)]
-    unit = ""
+    concentration_line = ""
     if concentrations:
-        unit = re.sub(r"^\d+(?:[.,]\d+)?\s*", "", concentrations[-1])
-    concentration_line = clean_space(" + ".join(values) + (f" {unit}" if unit else ""))
-    return [part for part in parts if part], values, clean_space(" ".join(filter(None, [concentration_line, formulation])))
+        units = [re.sub(r"\s*/\s*", "/", match["unit"].lower()) for match in concentrations]
+        units = [
+            re.sub(r"\b(?:ml|l|ufc|ui)\b", lambda part: {"ml": "mL"}.get(part[0], part[0].upper()), unit)
+            for unit in units
+        ]
+        amounts = [match["amount"] for match in concentrations]
+        if len(set(unit.casefold() for unit in units)) == 1:
+            concentration_line = " + ".join(amounts) + f" {units[-1]}"
+        else:
+            concentration_line = " + ".join(f"{amount} {unit}" for amount, unit in zip(amounts, units))
+    return [part for part in parts if part], clean_space(f"{concentration_line} {formulation}")
 
 
 def _formatted_product(row: pd.Series, language: str, product_type: ProductType) -> str:
@@ -167,20 +183,20 @@ def _formatted_product(row: pd.Series, language: str, product_type: ProductType)
             f"{technical_product_without_concentration(first)}\n"
             f"{technical_product_without_concentration(second)}"
         )
-    pt_parts, values, final_line = _product_parts(pt)
-    first_parts = pt_parts if language == "en" else [
-        clean_space(part) for part in re.split(r"\s*\+\s*", first)
-    ]
-    second_parts = [clean_space(part) for part in re.split(r"\s*\+\s*", second)]
+    pt = formulated_product_from_brand(pt, clean_space(row.get("marca_comercial", "")))
+    formulation = clean_space(row.get("formulacao", "")) or f"{first} {second}"
+    pt_parts, final_line = _product_parts(pt, formulation)
+    first_parts = pt_parts if language == "en" else _product_parts(first)[0]
+    second_parts = _product_parts(second)[0]
     if len(pt_parts) <= 1:
         return "\n".join(filter(None, [
-            first_parts[0] if first_parts else first,
-            second_parts[0] if second_parts else second,
+            capitalize_product(" + ".join(first_parts)),
+            capitalize_product(" + ".join(second_parts)),
             final_line,
         ]))
-    first_line = " + ".join(first_parts)
-    second_line = " +\n".join(second_parts)
-    return f"{first_line}\n\n{second_line}\n\n{final_line}".strip()
+    first_line = capitalize_product(" + ".join(first_parts))
+    second_line = capitalize_product(" +\n".join(second_parts))
+    return "\n\n".join(filter(None, [first_line, second_line, final_line]))
 
 
 def _brand_for_magazine(value: str, separate_registration: bool) -> str:
@@ -235,6 +251,7 @@ def create_magazine_layouts(
                 "产品 | Product": _formatted_product(row, "cn", product_type),
             })
     paths = {"pt_en": output_dir / f"{stem}_pt_en.xlsx", "cn_en": output_dir / f"{stem}_cn_en.xlsx"}
-    write_xlsx(pt_rows, paths["pt_en"], magazine=True)
-    write_xlsx(cn_rows, paths["cn_en"], magazine=True)
+    italic_products = biological_rows(translated_control, "produto_pt")
+    write_xlsx(pt_rows, paths["pt_en"], magazine=True, italic_products=italic_products)
+    write_xlsx(cn_rows, paths["cn_en"], magazine=True, italic_products=italic_products)
     return paths

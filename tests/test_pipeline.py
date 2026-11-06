@@ -1,9 +1,14 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
+from aprovacoes.export import biological_rows, write_xlsx
 from aprovacoes.models import ProductType
 from aprovacoes.parser import detect_product_type, parse
 from aprovacoes.rules import apply_business_rules, normalize_formulated_product, technical_product_without_concentration
 from aprovacoes.stages import _formatted_product
+from aprovacoes.translations import Translator
+from openpyxl import load_workbook
 import pandas as pd
 
 
@@ -160,7 +165,7 @@ k) Classificação do potencial de periculosidade ambiental: Classe III - Produt
         })
         self.assertEqual(
             _formatted_product(row, "en", ProductType.FORMULADO),
-            "Glufosinato - sal de amônio\nglufosinate-ammonium\n200 g/L SL",
+            "Glufosinato - sal de amônio\nGlufosinate-ammonium\n200 g/L SL",
         )
 
     def test_multiple_ingredients_share_concentration_unit_on_final_line(self):
@@ -181,7 +186,7 @@ k) Classificação do potencial de periculosidade ambiental: Classe III - Produt
         })
         result = _formatted_product(row, "en", ProductType.FORMULADO)
         self.assertIn("Fluazinam + Tiofanato-Metílico", result)
-        self.assertIn("fluazinam +", result)
+        self.assertIn("\nFluazinam +", result)
         self.assertIn("thiophanate-methyl", result)
 
     def test_technical_magazine_never_reintroduces_concentration(self):
@@ -191,6 +196,94 @@ k) Classificação do potencial de periculosidade ambiental: Classe III - Produt
             "produto_cn": "麦草畏 970 g/kg",
         })
         self.assertEqual(_formatted_product(row, "en", ProductType.TECNICO), "Dicamba\nDicamba")
+
+    def test_two_four_d_preserves_variant_and_other_ingredients(self):
+        source = "2,4 d - sal de dimetilamina (Herbicida) (481.93 g/L) + aminopiralide (60.9 g/L) SL"
+        product = normalize_formulated_product(source)
+        dictionary = Path(__file__).resolve().parents[1] / "data" / "dicionario_final.xlsx"
+        translator = Translator(dictionary, online_fallback=False)
+        row = pd.Series({
+            "produto_pt": product,
+            "produto_en": translator.product(product, "en", ProductType.FORMULADO),
+            "produto_cn": translator.product(product, "cn", ProductType.FORMULADO),
+        })
+        for language in ("en", "cn"):
+            layout = _formatted_product(row, language, ProductType.FORMULADO)
+            self.assertIn("2,4-D - sal de dimetilamina +", layout)
+            self.assertTrue(layout.endswith("481.93 + 60.9 g/L SL"))
+        self.assertEqual(translator.product("2,4-d", "cn", ProductType.TECNICO), "2,4-滴")
+        self.assertEqual(
+            translator.product("Azoxistrobina + ciproconazol", "en", ProductType.FORMULADO),
+            "Azoxystrobin + cyproconazole",
+        )
+        self.assertEqual(
+            technical_product_without_concentration("2,4-d (sal de colina) (970 g/kg) TC"),
+            "2,4-D sal de colina TC",
+        )
+
+    def test_biological_product_layout_keeps_formula_and_concentration_outside_italics(self):
+        row = pd.Series({
+            "produto_pt": "bacillus subtilis (Microbiológico) (2 x 10^+8 UFC/g WG)",
+            "produto_en": "bacillus subtilis (Microbial product)",
+            "produto_cn": "bacillus subtilis (微生物制品)",
+        })
+        product = _formatted_product(row, "cn", ProductType.FORMULADO)
+        self.assertEqual(product, "Bacillus subtilis\nBacillus subtilis\n2 x 10^+8 UFC/g WG")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "aprovados.xlsx"
+            write_xlsx([{"produto_pt": "Micromus angulatus"}], path, italic_products={0})
+            self.assertEqual(biological_rows(path, "produto_pt"), {0})
+            write_xlsx([{"产品 | Product": product}], path, magazine=True, italic_products={0})
+            workbook = load_workbook(path, rich_text=True)
+            try:
+                rich_text = workbook.active["A2"].value
+                self.assertEqual(str(rich_text), product)
+                self.assertTrue(rich_text[0].font.i)
+                self.assertEqual(rich_text[1], "\n2 x 10^+8 UFC/g WG")
+            finally:
+                workbook.close()
+
+    def test_product_removes_strains_without_losing_concentrations(self):
+        self.assertEqual(
+            normalize_formulated_product(
+                "Trichoderma asperelloides, isolado ESALQ 1306 (20 g/L) + "
+                "Bacillus velezensis (cepa CMRP6330) (80 g/L) SC"
+            ),
+            "Trichoderma asperelloides 20 g/L + bacillus velezensis 80 g/L SC",
+        )
+        self.assertEqual(
+            technical_product_without_concentration("Bacillus velezensis, cepa CMRP6330"),
+            "Bacillus velezensis",
+        )
+
+    def test_act_58_concentration_from_brand_in_existing_control(self):
+        row = pd.Series({
+            "produto_pt": "Azoxistrobina + ciproconazol",
+            "produto_en": "azoxystrobin + cyproconazole",
+            "produto_cn": "嘧菌酯 + 环丙唑醇",
+            "marca_comercial": "AZOXYSTROBIN 200 G/L + CYPROCONAZOLE 80 G/L SC SINO-AGRI (32826)",
+        })
+        for language in ("en", "cn"):
+            self.assertTrue(_formatted_product(row, language, ProductType.FORMULADO).endswith("200 + 80 g/L SC"))
+        row["marca_comercial"] = "AZOXYSTROBIN 280 SC"
+        self.assertNotIn("280", _formatted_product(row, "en", ProductType.FORMULADO))
+
+    def test_brand_only_fills_missing_concentration_and_matches_ingredient_order(self):
+        self.assertEqual(
+            normalize_formulated_product(
+                "Azoxistrobina 200 g/L + ciproconazol",
+                "CYPROCONAZOLE 80 g/L + AZOXYSTROBIN 210 g/L SC",
+            ),
+            "Azoxistrobina 200 g/L + ciproconazol 80 g/L SC",
+        )
+
+    def test_strain_cleanup_preserves_scientific_strength_and_next_species(self):
+        self.assertEqual(
+            normalize_formulated_product(
+                "Bacillus velezensiscepa RTI301 e Trichoderma harzianumCepa IB 19/17 2 x 10^+8 UFC/g WG"
+            ),
+            "Bacillus velezensis + trichoderma harzianum 2 x 10^+8 UFC/g WG",
+        )
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from .models import ApprovalRecord, ProductType
-from .rules import technical_product_without_concentration
-from .text import clean_space, registry_key
+from .rules import FORMULATION_RE, technical_product_without_concentration
+from .text import clean_space, key, registry_key
 
 
 FORMULATED_URL = "https://dados.agricultura.gov.br/dataset/6c913699-e82e-4da3-a0a1-fb6c431e367f/resource/d30b30d7-e256-484e-9ab8-cd40974e1238/download/agrofitprodutosformulados.csv"
@@ -47,8 +47,13 @@ def enrich(records: list[ApprovalRecord], product_type: ProductType, csv_path: P
             record.warnings.append("registro não encontrado no Agrofit")
             continue
         product = clean_space(row.get(product_column, ""))
+        category = key(row.get("CLASSE", ""))
+        record.biologico |= "biologico" in category
+        if not product:
+            continue
         if product_type is ProductType.FORMULADO:
             formulation = clean_space(row.get(formulation_column, ""))
-            record.produto = clean_space(f"{product} {formulation}")
+            codes = FORMULATION_RE.findall(formulation.split(" - ", 1)[0])
+            record.produto = clean_space(f"{product} {' '.join(codes)}")
         else:
             record.produto = technical_product_without_concentration(product)

@@ -7,6 +7,10 @@ from pathlib import Path
 import pandas as pd
 
 from .models import ApprovalRecord, ProductType
+from .rules import (
+    BIOLOGICAL_NAME_RE, CONCENTRATION_RE, FORMULATION_RE, TWO_FOUR_D_RE,
+    capitalize_product, remove_product_parentheses, remove_product_strain,
+)
 from .text import clean_space, key
 
 
@@ -121,7 +125,7 @@ NOTE_CN = {
 # Nomes comuns internacionais confirmados para ingredientes cujas monografias
 # ainda não possuem nome inglês/chinês preenchido no dicionário legado.
 INGREDIENT_OVERRIDES = {
-    "2,4-d": ("2,4-D", "2,4-滴"),
+    "2 4 d": ("2,4-D", "2,4-滴"),
     "carfentrazona etilica": ("carfentrazone-ethyl", "唑酮草酯"),
     "cialofope butilico": ("cyhalofop-butyl", "氰氟草酯"),
     "fenpropimorfe": ("fenpropimorph", "丁苯吗啉"),
@@ -228,12 +232,18 @@ class Translator:
 
     def ingredient(self, value: str, language: str) -> str:
         mapping = self.ingredient_en if language == "en" else self.ingredient_cn
+        two_four_d = TWO_FOUR_D_RE.match(value)
+        if two_four_d and value[two_four_d.end():].strip():
+            # A busca parcial do dicionário perderia a variante ou o sal.
+            value = TWO_FOUR_D_RE.sub("2,4-D", value)
+            self.missing.add(value)
+            return value
         normalized = ingredient_key(value)
         if normalized in mapping:
             return mapping[normalized]
         # Nomes científicos permanecem em latim. A verificação antecede a
         # busca parcial para impedir colisões acidentais no dicionário.
-        if re.match(r"^(?:Bacillus|Beauveria|Metarhizium|Ooencyrtus|Pseudomonas|Trichoderma)\b", value, re.I):
+        if BIOLOGICAL_NAME_RE.search(value):
             translated = clean_space(value)
             replacements = {
                 "isolado": ("isolate", "菌株"), "cepa": ("strain", "菌株"),
@@ -277,15 +287,15 @@ class Translator:
 
     @staticmethod
     def _ingredient_part(value: str) -> str:
-        value = re.sub(r"\([^)]*\d[^)]*\)", "", clean_space(value))
+        value = CONCENTRATION_RE.sub("", remove_product_strain(remove_product_parentheses(clean_space(value))))
         value = re.sub(r"\b\d+(?:[.,]\d+)?\s*(?:g|kg|mg|mL|L|UFC|UI)(?:\s*/\s*(?:g|kg|mL|L))?\b", "", value, flags=re.I)
-        value = re.sub(r"\b\d+(?:[.,]\d+)?\s*%", "", value)
-        value = re.sub(r"\b(?:SC|SL|EC|WG|WP|CS|OD|FS|EW|GR|ME|SP|SG|SE)\b", "", value, flags=re.I)
+        value = FORMULATION_RE.sub("", value)
         return clean_space(value).strip(" ,;+-")
 
     def product(self, value: str, language: str, product_type: ProductType) -> str:
-        parts = [self._ingredient_part(part) for part in re.split(r"\s*(?:\+|;)\s*", clean_space(value))]
-        return " + ".join(self.ingredient(part, language) for part in parts if part)
+        value = CONCENTRATION_RE.sub("", remove_product_parentheses(clean_space(value)))
+        parts = [self._ingredient_part(part) for part in re.split(r"\s*(?:\+|;)\s*", value)]
+        return capitalize_product(" + ".join(self.ingredient(part, language) for part in parts if part))
 
     def use(self, value: str, language: str) -> str:
         value = clean_space(value)

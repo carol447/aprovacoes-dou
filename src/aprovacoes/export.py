@@ -1,17 +1,39 @@
 from __future__ import annotations
 
 import json
+from copy import copy
 from pathlib import Path
 
 import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from openpyxl.styles import Alignment, Font, PatternFill, Side, Border
 
 from .models import ApprovalRecord, ProductType
+from .rules import BIOLOGICAL_NAME_RE, CONCENTRATION_RE, FORMULATION_RE
 from .translations import Translator
 
 
-def write_xlsx(rows: list[dict[str, str]], path: Path, magazine: bool = False) -> None:
+def biological_rows(path: Path, column: str) -> set[int]:
+    wb = load_workbook(path, read_only=True, rich_text=True)
+    try:
+        rows = wb.active.iter_rows()
+        index = [cell.value for cell in next(rows)].index(column)
+        return {
+            number for number, row in enumerate(rows)
+            if row[index].value and (
+                row[index].font.italic or BIOLOGICAL_NAME_RE.search(str(row[index].value))
+            )
+        }
+    finally:
+        wb.close()
+
+
+def write_xlsx(
+    rows: list[dict[str, str]] | pd.DataFrame, path: Path, magazine: bool = False,
+    italic_products: set[int] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_excel(path, index=False)
     wb = load_workbook(path)
@@ -33,6 +55,25 @@ def write_xlsx(rows: list[dict[str, str]], path: Path, magazine: bool = False) -
             ws.column_dimensions[ws.cell(1, index).column_letter].width = width
         ws.row_dimensions[1].height = 52
         ws.sheet_view.showGridLines = False
+    for column in ws[1]:
+        if column.value not in {"Produto", "produto_pt", "produto_en", "produto_cn", "Produto | Product", "产品 | Product"}:
+            continue
+        for number in italic_products or ():
+            cell = ws.cell(number + 2, column.column)
+            if not cell.value:
+                continue
+            if magazine:
+                names, separator, last = cell.value.rpartition("\n")
+                suffix = FORMULATION_RE.sub("", last).strip()
+                if separator and (not suffix or CONCENTRATION_RE.search(suffix)):
+                    cell.value = CellRichText(
+                        TextBlock(InlineFont(rFont="Times New Roman", sz=9, i=True), names),
+                        separator + last,
+                    )
+                    continue
+            font = copy(cell.font)
+            font.italic = True
+            cell.font = font
     wb.save(path)
 
 
@@ -46,9 +87,10 @@ def export_all(
         "cn_en": output_dir / f"{stem}_cn_en.xlsx",
         "pendencias": output_dir / f"{stem}_pendencias.json",
     }
-    write_xlsx([record.operational_row(product_type) for record in records], paths["pt"])
-    write_xlsx([translator.bilingual_row(record, product_type, "pt") for record in records], paths["pt_en"], True)
-    write_xlsx([translator.bilingual_row(record, product_type, "cn") for record in records], paths["cn_en"], True)
+    italic_products = {index for index, record in enumerate(records) if record.biologico}
+    write_xlsx([record.operational_row(product_type) for record in records], paths["pt"], italic_products=italic_products)
+    write_xlsx([translator.bilingual_row(record, product_type, "pt") for record in records], paths["pt_en"], True, italic_products)
+    write_xlsx([translator.bilingual_row(record, product_type, "cn") for record in records], paths["cn_en"], True, italic_products)
     pending = {
         "termos_sem_traducao": sorted(item for item in translator.missing if item),
         "registros_com_alertas": [

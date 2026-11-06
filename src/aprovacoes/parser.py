@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from .models import ApprovalRecord, ProductType
+from .rules import BIOLOGICAL_NAME_RE
 from .text import clean_space, preserve_tc_registry
 
 
@@ -79,9 +80,13 @@ def parse(text: str, product_type: ProductType) -> list[ApprovalRecord]:
         fabricante = field(block, fabricante_label)
         if product_type is ProductType.FORMULADO and not fabricante:
             fabricante = field(block, "fabricante")
+        cientifico = field(block, "cientifico")
+        nome_biologico = BIOLOGICAL_NAME_RE.search(cientifico) or re.match(
+            r"^[^\W\d_]+\s+(?!(?:da|das|de|do|dos|se)\b)[^\W\d_]+", cientifico, re.I
+        )
         produto = field(block, "produto")
         if not produto or clean_space(produto).casefold().rstrip(" .") == "não se aplica":
-            produto = field(block, "cientifico")
+            produto = cientifico
         record = ApprovalRecord(
             registrante=field(block, "titular"),
             marca_comercial=field(block, "marca"),
@@ -90,6 +95,7 @@ def parse(text: str, product_type: ProductType) -> list[ApprovalRecord]:
             produto=produto,
             registro=registro,
             source_index=index,
+            biologico=bool(nome_biologico),
         )
         tox, amb = field(block, "tox"), field(block, "amb")
         record.nota = " | ".join(part for part in (tox, amb) if part)

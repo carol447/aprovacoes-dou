@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import re
+from difflib import get_close_matches
 
 from .models import ApprovalRecord, ProductType
-from .text import clean_space
+from .text import clean_space, key
 
 
 REGISTRANT_EXCEPTIONS = {
@@ -178,44 +179,141 @@ def normalize_manufacturer(value: str, product_type: ProductType) -> str:
     return clean_space(value).strip(" .;-")
 
 
+FORMULATION_RE = re.compile(
+    r"(?<![\w-])(?:AL|CB|CF|CG|CS|DC|DP|DS|EC|EG|EO|EW|FD|FF|FS|FT|FU|FW|GB|GE|GL|"
+    r"GR|HN|LS|ME|MG|MP|OD|PA|RB|SB|SC|SE|SG|SL|SO|SP|TB|TC|TK|UL|VP|WG|WP|WS|XX)(?![\w-])",
+    re.I,
+)
+CONCENTRATION_RE = re.compile(
+    r"(?<![\w/])(?P<amount>\d+(?:[.,]\d+)*(?:\s*(?:[×x*]\s*10(?:\^\s*[+-]?\d+|[⁰¹²³⁴⁵⁶⁷⁸⁹]+)|e[+-]?\d+))?)"
+    r"\s*(?P<unit>%|(?:g|kg|mg|µg|mL|L|UFC|UI|unidades?|indiv[ií]duos?|"
+    r"con[ií]dios?|esporos?)\s*/\s*(?:g|kg|mL|L)\b)",
+    re.I,
+)
+BIOLOGICAL_NAME_RE = re.compile(
+    r"\b(?:Bacillus|Beauveria|Heterorhabditis|Metarhizium|Ooencyrtus|"
+    r"Pseudomonas|Trichoderma|Thymus)\s+[a-z]+\b", re.I,
+)
+TWO_FOUR_D_RE = re.compile(r"\b2\s*,\s*4\s*[-–]?\s*d\b", re.I)
+STRAIN_RE = re.compile(
+    r"\s*,?\s*(?:(?:\b(?:cepas?|isolados?|strains?|isolates?)|(?<=[a-z])(?:cepa|isolado))\b|菌株).*?"
+    rf"(?=\s*(?:{CONCENTRATION_RE.pattern}|{FORMULATION_RE.pattern}\s*(?:[+;]|$)|[+;]|$))",
+    re.I,
+)
+
+
+def remove_product_strain(value: str) -> str:
+    value = re.sub(
+        rf"\s*(?:\be\b|\band\b|和)\s*(?={BIOLOGICAL_NAME_RE.pattern})",
+        " + ",
+        value,
+        flags=re.I,
+    )
+    return STRAIN_RE.sub(" ", value)
+
+
+def split_product_ingredients(value: str) -> list[str]:
+    parts = []
+    start = 0
+    for match in re.finditer(rf"{CONCENTRATION_RE.pattern}|(?P<separator>[+;])", value, re.I):
+        if match["separator"]:
+            parts.append(value[start:match.start()].strip())
+            start = match.end()
+    return parts + [value[start:].strip()]
+
+
+def formulated_product_from_brand(value: str, brand: str) -> str:
+    """Fill missing strengths from an explicit, unambiguous DOU brand."""
+    ingredients = split_product_ingredients(value)
+    if not all(ingredients) or ";" in brand or all(CONCENTRATION_RE.search(part) for part in ingredients):
+        return value
+    brand_parts = split_product_ingredients(brand)
+    strengths = [list(CONCENTRATION_RE.finditer(part)) for part in brand_parts]
+    if len(strengths) != len(ingredients) or any(len(matches) != 1 for matches in strengths):
+        return value
+    matches_by_name = strengths
+    if len(ingredients) > 1:
+        brand_names = [key(part[:matches[0].start()]) for part, matches in zip(brand_parts, strengths)]
+        names = [
+            get_close_matches(
+                key(FORMULATION_RE.sub("", CONCENTRATION_RE.sub("", ingredient))),
+                brand_names, n=2, cutoff=0.75,
+            )
+            for ingredient in ingredients
+        ]
+        if any(len(name) != 1 for name in names) or len({name[0] for name in names}) != len(ingredients):
+            return value
+        matches_by_name = [strengths[brand_names.index(name[0])] for name in names]
+    product = " + ".join(
+        ingredient if CONCENTRATION_RE.search(ingredient) else f"{ingredient.rstrip('. ')} {matches[0][0]}"
+        for ingredient, matches in zip(ingredients, matches_by_name)
+    )
+    suffix = brand_parts[-1][strengths[-1][0].end():].lstrip(" )")
+    code = FORMULATION_RE.match(suffix)
+    if code and not FORMULATION_RE.search(value):
+        product += f" {code[0]}"
+    return product
+
+
+def capitalize_product(value: str) -> str:
+    value = TWO_FOUR_D_RE.sub("2,4-D", value)
+    return re.sub(r"[^\W\d_]", lambda match: match[0].upper(), value, count=1)
+
+
+def _remove_product_description(value: str) -> str:
+    if TWO_FOUR_D_RE.search(value):
+        value = re.sub(rf"({FORMULATION_RE.pattern})\s+-\s+.*$", r"\1", value, flags=re.I)
+        return re.sub(r"\s+-\s+Produto T[eé]cnico\s*$", "", value, flags=re.I)
+    return re.sub(r"\s+-\s+.*$", "", value)
+
+
+def remove_product_parentheses(value: str) -> str:
+    def replace(match: re.Match) -> str:
+        content = match[1]
+        if re.fullmatch(rf"{CONCENTRATION_RE.pattern}(?:\s+{FORMULATION_RE.pattern})?", content, re.I):
+            return f" {content} "
+        formulation = FORMULATION_RE.match(content)
+        if formulation and re.fullmatch(r"(?:\s*-\s*.+)?", content[formulation.end():]):
+            return f" {formulation[0]} "
+        if re.match(r"(?:cepa|isolado|strain|isolate)\b", content, re.I):
+            return f" {content} "
+        if re.match(r"(?:sal|[ée]ster|amina|dimetilamina)\b", content, re.I):
+            prefix = value[:match.start()].rstrip()
+            if any(name.end() == len(prefix) for name in TWO_FOUR_D_RE.finditer(prefix)):
+                return f" {content} "
+        return " "
+
+    return re.sub(r"\(\s*([^()]*?)\s*\)", replace, value)
+
+
 def technical_product_without_concentration(value: str) -> str:
     value = clean_space(value)
-    value = re.sub(r"\([^)]*\)", "", value)
-    value = re.sub(r"\b\d+(?:[.,]\d+)?\s*(?:g|kg|mg|mL|L|UFC|UI|unidades?)\s*/\s*(?:g|kg|mL|L)\b", "", value, flags=re.I)
-    value = re.sub(r"\b\d+(?:[.,]\d+)?\s*%", "", value)
-    value = re.sub(r"\s+-\s+.*$", "", value)
+    value = remove_product_strain(remove_product_parentheses(value))
+    value = CONCENTRATION_RE.sub("", value)
+    value = _remove_product_description(value)
     value = re.sub(r"\s*;\s*", " + ", value)
     value = re.sub(r"\s*\+\s*", " + ", value)
     value = clean_space(value).strip(" ,;+.-").lower()
-    if value:
-        value = value[0].upper() + value[1:]
-    for code in ("TC", "TK", "MP", "SC", "SL", "EC", "WG", "WP", "CS", "OD", "FS", "EW", "GR", "ME", "SP", "SG", "SE", "UL"):
-        value = re.sub(rf"\b{code.lower()}\b", code, value)
+    value = capitalize_product(value)
+    value = FORMULATION_RE.sub(lambda match: match[0].upper(), value)
     for strain_code in ("CCT", "IB", "IBCB", "ATCC"):
         value = re.sub(rf"\b{strain_code.lower()}\b", strain_code, value)
     return clean_space(value)
 
 
-def normalize_formulated_product(value: str) -> str:
+def normalize_formulated_product(value: str, brand: str = "") -> str:
     """Condensa o produto formulado no padrão editorial da revista."""
     value = clean_space(value).rstrip(".")
-    value = re.sub(r"\s+-\s+.*$", "", value)
-    concentration = (
-        r"\d+(?:[.,]\d+)?\s*(?:g|kg|mg|mL|L|UFC|UI|unidades?|indiv[ií]duos?)"
-        r"\s*/\s*(?:g|kg|mL|L)"
-    )
-    value = re.sub(rf"\(\s*({concentration})\s*\)", r" \1 ", value, flags=re.I)
-    value = re.sub(r"\(\s*(\d+(?:[.,]\d+)?\s*%)\s*\)", r" \1 ", value)
-    value = re.sub(r"\([^)]*\)", "", value)
+    value = re.sub(rf"({FORMULATION_RE.pattern})\s+-\s+.*$", r"\1", value, flags=re.I)
+    value = remove_product_strain(remove_product_parentheses(value))
     value = re.sub(r"[()]", "", value)
+    value = formulated_product_from_brand(value, brand)
     value = re.sub(r"\s*;\s*", " + ", value)
-    value = re.sub(r"\s*\+\s*", " + ", value)
+    value = re.sub(r"(?<!\^)(?<!\d[eE])\s*\+\s*", " + ", value)
     value = clean_space(value).strip(" ,;+.-")
     value = value.lower()
-    if value:
-        value = value[0].upper() + value[1:]
-    for code in ("SC", "SL", "EC", "WG", "WP", "CS", "OD", "FS", "EW", "GR", "ME", "SP", "SG", "SE", "UL"):
-        value = re.sub(rf"\b{code.lower()}\b", code, value)
+    value = capitalize_product(value)
+    value = FORMULATION_RE.sub(lambda match: match[0].upper(), value)
     value = re.sub(r"\bml\b", "mL", value)
     value = re.sub(r"/(?:ml|l)\b", lambda match: "/mL" if match.group(0).lower() == "/ml" else "/L", value)
     value = re.sub(r"\bufc\b", "UFC", value)
@@ -227,12 +325,13 @@ def normalize_formulated_product(value: str) -> str:
 
 def apply_business_rules(record: ApprovalRecord, product_type: ProductType) -> ApprovalRecord:
     record.registrante = normalize_registrant(record.registrante)
+    brand = record.marca_comercial
     record.marca_comercial = normalize_brand(record.marca_comercial, record.registro)
     record.nota = normalize_note(record.nota)
     record.fabricante = normalize_manufacturer(record.fabricante, product_type)
     if product_type is ProductType.FORMULADO:
         record.recomendacao_uso = normalize_use(record.recomendacao_uso)
-        record.produto = normalize_formulated_product(record.produto)
+        record.produto = normalize_formulated_product(record.produto, brand)
     else:
         record.produto = technical_product_without_concentration(record.produto)
     return record

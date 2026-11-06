@@ -20,6 +20,7 @@ class ApprovalRecord:
     registro: str = ""
     source_index: int = 0
     warnings: list[str] = field(default_factory=list)
+    biologico: bool = False
 
     def operational_row(self, product_type: ProductType) -> dict[str, str]:
         if product_type is ProductType.FORMULADO:
