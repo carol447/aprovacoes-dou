@@ -106,8 +106,13 @@ extração direta do DOU.
 - `*_cn_en.xlsx`: revista mandarim–inglês;
 - `*_pendencias.json`: termos sem tradução e registros que precisam de conferência.
 
-Nos produtos técnicos, `Produto` nunca inclui concentração. Nos formulados, produto,
-concentração e formulação vêm da base Agrofit.
+Nos produtos técnicos, `Produto` nunca inclui concentração. Para os formulados,
+as concentrações explícitas no DOU têm prioridade, inclusive as da marca
+comercial quando podem ser associadas ao ingrediente. O campo
+`INGREDIENTE_ATIVO` do CSV do Agrofit, cruzado pelo número de registro, completa
+as concentrações que faltam. O relatório separa os biológicos sem concentração
+dos demais formulados sem valor informado. Quando existe uma concentração
+para um biológico, ela é preservada e seu nome científico aparece em itálico.
 
 ## Fontes de dados
 

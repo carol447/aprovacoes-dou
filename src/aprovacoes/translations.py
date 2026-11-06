@@ -20,6 +20,11 @@ CROPS = {
     "alho": ("garlic", "大蒜"), "ameixa": ("plum", "李子"),
     "amendoim": ("peanut", "花生"), "arroz": ("rice", "水稻"),
     "arroz irrigado": ("irrigated rice", "灌溉水稻"), "aveia": ("oat", "燕麦"),
+    "arroz sequeiro": ("upland rice", "旱稻"),
+    "culturas do abacate": ("avocado crops", "鳄梨作物"),
+    "palma forrageira": ("forage cactus", "饲用仙人掌"),
+    "pinhao manso": ("physic nut", "麻疯树"),
+    "alem de combate a gafanhotos": ("also for grasshopper control", "也用于防治蝗虫"),
     "banana": ("banana", "香蕉"), "batata": ("potato", "马铃薯"),
     "cafe": ("coffee", "咖啡"), "cana de acucar": ("sugarcane", "甘蔗"),
     "cebola": ("onion", "洋葱"), "cevada": ("barley", "大麦"),
@@ -125,6 +130,24 @@ NOTE_CN = {
 # Nomes comuns internacionais confirmados para ingredientes cujas monografias
 # ainda não possuem nome inglês/chinês preenchido no dicionário legado.
 INGREDIENT_OVERRIDES = {
+    "carbossulfano": ("carbosulfan", "丁硫克百威"),
+    "espinosade": ("spinosad", "多杀霉素"),
+    "oxadiazona": ("oxadiazon", "噁草酮"),
+    "haloxyfop p methyl": ("haloxyfop-P-methyl", "高效氟吡甲禾灵"),
+    "haloxifope p metilico": ("haloxyfop-P-methyl", "高效氟吡甲禾灵"),
+    "bicarbonato de potassio": ("potassium bicarbonate", "碳酸氢钾"),
+    "cinamaldeido": ("cinnamaldehyde", "肉桂醛"),
+    "metribuzim": ("metribuzin", "嗪草酮"),
+    "metamitrona": ("metamitron", "苯嗪草酮"),
+    "tembotriona": ("tembotrione", "环磺酮"),
+    "tembotrione": ("tembotrione", "环磺酮"),
+    "nicosulfurom": ("nicosulfuron", "烟嘧磺隆"),
+    "propiconazole": ("propiconazole", "丙环唑"),
+    "acetato de z 9 tetradecenila": ("(Z)-9-tetradecenyl acetate", "(Z)-9-十四碳烯乙酸酯"),
+    "acetato de z 7 dodecenila": ("(Z)-7-dodecenyl acetate", "(Z)-7-十二碳烯乙酸酯"),
+    "acetato de z 11 hexadecenila": ("(Z)-11-hexadecenyl acetate", "(Z)-11-十六碳烯乙酸酯"),
+    "acetato de z 8 dodecenila": ("(Z)-8-dodecenyl acetate", "(Z)-8-十二碳烯乙酸酯"),
+    "e 8 dodecenol": ("(E)-8-dodecenol", "(E)-8-十二碳烯醇"),
     "2 4 d": ("2,4-D", "2,4-滴"),
     "carfentrazona etilica": ("carfentrazone-ethyl", "唑酮草酯"),
     "cialofope butilico": ("cyhalofop-butyl", "氰氟草酯"),
@@ -239,8 +262,6 @@ class Translator:
             self.missing.add(value)
             return value
         normalized = ingredient_key(value)
-        if normalized in mapping:
-            return mapping[normalized]
         # Nomes científicos permanecem em latim. A verificação antecede a
         # busca parcial para impedir colisões acidentais no dicionário.
         if BIOLOGICAL_NAME_RE.search(value):
@@ -259,8 +280,13 @@ class Translator:
             for source, pair in FORMULATIONS.items():
                 translated = re.sub(re.escape(source), pair[0 if language == "en" else 1], translated, flags=re.I)
             return translated
+        if normalized in mapping:
+            return mapping[normalized]
         # O processo legado usa busca parcial após remover concentração, formulação e sais.
-        candidates = [(source, target) for source, target in mapping.items() if source and source in normalized]
+        candidates = [
+            (source, target) for source, target in mapping.items()
+            if source and f" {source} " in f" {normalized} "
+        ]
         if candidates:
             return max(candidates, key=lambda item: len(item[0]))[1]
         translated = self._online(value, language)
@@ -346,6 +372,9 @@ class Translator:
             pair = CROPS.get(key(item))
             if pair:
                 translated.append(pair[0] if language == "en" else pair[1])
+            elif re.fullmatch(r"[A-Z][a-z]+ [a-z]+", item):
+                # Os nomes científicos dos alvos já estão em latim.
+                translated.append(item)
             else:
                 online = self._online(item, language)
                 if online:

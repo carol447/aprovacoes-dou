@@ -11,19 +11,22 @@ from openpyxl.cell.text import InlineFont
 from openpyxl.styles import Alignment, Font, PatternFill, Side, Border
 
 from .models import ApprovalRecord, ProductType
-from .rules import BIOLOGICAL_NAME_RE, CONCENTRATION_RE, FORMULATION_RE
+from .rules import CONCENTRATION_RE, FORMULATION_RE, has_biological_product_hint
 from .translations import Translator
 
 
 def biological_rows(path: Path, column: str) -> set[int]:
-    wb = load_workbook(path, read_only=True, rich_text=True)
+    wb = load_workbook(path, rich_text=True)
     try:
         rows = wb.active.iter_rows()
         index = [cell.value for cell in next(rows)].index(column)
         return {
             number for number, row in enumerate(rows)
             if row[index].value and (
-                row[index].font.italic or BIOLOGICAL_NAME_RE.search(str(row[index].value))
+                row[index].font.italic
+                or has_biological_product_hint(str(row[index].value))
+                or (isinstance(row[index].value, CellRichText)
+                    and any(isinstance(run, TextBlock) and run.font.i for run in row[index].value))
             )
         }
     finally:

@@ -12,7 +12,8 @@ from .models import ApprovalRecord, ProductType
 from .parser import detect_product_type, parse
 from .rules import (
     CONCENTRATION_RE, FORMULATION_RE, apply_business_rules, capitalize_product,
-    formulated_product_from_brand, normalize_formulated_product, remove_product_parentheses, remove_product_strain,
+    fill_product_concentrations, formulation_from_brand, normalize_formulated_product,
+    remove_product_parentheses, remove_product_strain,
     split_product_ingredients,
     technical_product_without_concentration,
 )
@@ -52,6 +53,11 @@ def extract_act(
     records = parse(text, product_type)
     if not records:
         raise ValueError("Nenhum bloco de registro foi encontrado no ato")
+    if product_type is ProductType.FORMULADO:
+        for record in records:
+            record.produto = fill_product_concentrations(
+                normalize_formulated_product(record.produto), record.marca_comercial, from_brand=True,
+            )
     if agrofit_csv is None and download_agrofit:
         agrofit_csv = download_database(product_type, output_path.parent / "cache")
     if agrofit_csv is not None:
@@ -93,6 +99,10 @@ def _control_from_operational(input_path: Path, product_type: ProductType) -> pd
             "registro": source["Registro"],
             "formulacao": source["Formulação"] if "Formulação" in source.columns else "",
         })
+        control["formulacao"] = [
+            formulation or " ".join(dict.fromkeys(code.upper() for code in FORMULATION_RE.findall(product)))
+            for formulation, product in zip(control["formulacao"], control["produto_pt"])
+        ]
         return control[FORMULATED_CONTROL_COLUMNS]
     required = ["Registrante", "Marca comercial", "Nota", "Fabricante", "Produto"]
     missing = [column for column in required if column not in source.columns]
@@ -125,15 +135,30 @@ def translate_extraction(
         control["recomendacao_uso_en"] = control["recomendacao_uso_pt"].map(lambda value: translator.use(value, "en"))
         control["recomendacao_uso_cn"] = control["recomendacao_uso_pt"].map(lambda value: translator.use(value, "cn"))
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    write_xlsx(control, output_path, italic_products=biological_rows(input_path, "Produto"))
+    italic_products = biological_rows(input_path, "Produto")
+    write_xlsx(control, output_path, italic_products=italic_products)
     pending_path = output_path.with_name(f"{output_path.stem}_pendencias.json")
     pending = {"termos_sem_traducao": sorted(item for item in translator.missing if item)}
+    manufacturer = "fabricante_produto" if product_type is ProductType.FORMULADO else "fabricante"
+    pending["dados_para_conferir"] = [
+        {"marca": row.marca_comercial, "campos": fields}
+        for row in control.itertuples()
+        if (fields := [
+            label for label, present in (
+                ("registrante", row.registrante),
+                ("fabricante", getattr(row, manufacturer)),
+                ("classificação ambiental", re.search(r"\bClas\.\s*amb\.", row.nota_pt, re.I)),
+            ) if not present
+        ])
+    ]
     if product_type is ProductType.FORMULADO:
-        pending["formulados_sem_concentracao"] = [
-            {"registro": row.registro, "marca": row.marca_comercial}
-            for row in control.itertuples()
-            if any(not CONCENTRATION_RE.search(part) for part in split_product_ingredients(row.produto_pt))
-        ]
+        pending["formulados_sem_concentracao"] = []
+        pending["biologicos_sem_concentracao"] = []
+        for index, row in enumerate(control.itertuples()):
+            if all(CONCENTRATION_RE.search(part) for part in split_product_ingredients(row.produto_pt)):
+                continue
+            group = "biologicos_sem_concentracao" if index in italic_products else "formulados_sem_concentracao"
+            pending[group].append({"registro": row.registro, "marca": row.marca_comercial})
     pending_path.write_text(
         json.dumps(pending, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -183,8 +208,11 @@ def _formatted_product(row: pd.Series, language: str, product_type: ProductType)
             f"{technical_product_without_concentration(first)}\n"
             f"{technical_product_without_concentration(second)}"
         )
-    pt = formulated_product_from_brand(pt, clean_space(row.get("marca_comercial", "")))
-    formulation = clean_space(row.get("formulacao", "")) or f"{first} {second}"
+    formulation = (
+        clean_space(row.get("formulacao", ""))
+        or formulation_from_brand(clean_space(row.get("marca_comercial", "")))
+        or f"{first} {second}"
+    )
     pt_parts, final_line = _product_parts(pt, formulation)
     first_parts = pt_parts if language == "en" else _product_parts(first)[0]
     second_parts = _product_parts(second)[0]

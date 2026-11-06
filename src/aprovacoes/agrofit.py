@@ -6,7 +6,10 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from .models import ApprovalRecord, ProductType
-from .rules import FORMULATION_RE, technical_product_without_concentration
+from .rules import (
+    CONCENTRATION_RE, FORMULATION_RE, STEREOCHEMISTRY_RE, fill_product_concentrations,
+    normalize_formulated_product, technical_product_without_concentration,
+)
 from .text import clean_space, key, registry_key
 
 
@@ -54,6 +57,11 @@ def enrich(records: list[ApprovalRecord], product_type: ProductType, csv_path: P
         if product_type is ProductType.FORMULADO:
             formulation = clean_space(row.get(formulation_column, ""))
             codes = FORMULATION_RE.findall(formulation.split(" - ", 1)[0])
+            preserve_dou_name = STEREOCHEMISTRY_RE.search(record.produto) and not STEREOCHEMISTRY_RE.search(product)
+            if CONCENTRATION_RE.search(record.produto) or preserve_dou_name:
+                if not codes:
+                    codes = FORMULATION_RE.findall(product)
+                product = fill_product_concentrations(record.produto, normalize_formulated_product(product))
             record.produto = clean_space(f"{product} {' '.join(codes)}")
         else:
             record.produto = technical_product_without_concentration(product)

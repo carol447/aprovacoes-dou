@@ -3,14 +3,17 @@ from __future__ import annotations
 import re
 
 from .models import ApprovalRecord, ProductType
-from .rules import BIOLOGICAL_NAME_RE
+from .rules import has_biological_product_hint
 from .text import clean_space, preserve_tc_registry
 
 
 LABELS = {
     "titular": r"(?:Titular\s+do\s+registro|Nome\s+do\s+requerente\s+ou\s+titular)",
     "marca": r"Marca\s+comercial",
-    "fabricante_tecnico": r"Fabricantes?\s+do\s+Produto\s+t[eé]cnico(?:\s*\([^:\n]*\))?",
+    "fabricante_tecnico": (
+        r"Fabricantes?\s+(?:do\s+)?(?:Produto\s+t[eé]cnico|Ingrediente\s+ativo)"
+        r"(?:\s*\([^:\n]*\))?"
+    ),
     "fabricante": r"Fabricantes?(?:\(s\))?(?:\s+e\s+formulador(?:es)?(?:\(es\))?)?(?:\s*/\s*(?:Formulador(?:es)?(?:\s*/\s*Manipulador(?:es)?)?|Manipulador(?:es)?))?",
     "uso": r"Indica[cç][aã]o\s+de\s+uso(?:\s+aprovada)?",
     "produto": r"Nomes?\s+(?:comum|comuns)",
@@ -39,7 +42,13 @@ def detect_product_type(text: str) -> ProductType | None:
 
 def split_blocks(text: str) -> list[str]:
     text = normalize_dou_text(text)
-    item_start = r"\d+\s*(?:(?:\.\s*)?-\s*)?a\s*[.)]\s*"
+    text = re.split(
+        r"(?m)^[ \t]*(?:[A-ZÀ-Ý]{2,}(?:[ \t]+[A-ZÀ-Ý]{2,}){2,}"
+        r"(?=\n\s*(?:Substituto\b|Este conteúdo\b|RETIFICA|\Z))|Este conteúdo não substitui)",
+        text,
+        maxsplit=1,
+    )[0]
+    item_start = r"\d+\s*(?:(?:\.\s*)?-+\s*)?a\s*[.)]\s*"
     blocks = re.split(rf"(?m)^\s*{item_start}", text)
     if len(blocks) > 1:
         return [block.strip() for block in blocks[1:] if block.strip()]
@@ -51,7 +60,7 @@ def split_blocks(text: str) -> list[str]:
 def field(block: str, label: str) -> str:
     pattern = LABELS[label]
     match = re.search(
-        rf"(?:^|\n)\s*[a-z]\s*[.)]\s*{pattern}\s*:[ \t]*(.*?)"
+        rf"(?:^|\n)\s*[a-z]\s*[.)]\s*{pattern}(?:\s*:[ \t]*|[ \t]+)(.*?)"
         rf"(?=\n\s*[a-z]\s*[.)]\s*|\s+[a-l]\)\s*(?=[A-ZÀ-Ý])|\Z)",
         block,
         re.IGNORECASE | re.DOTALL,
@@ -62,6 +71,8 @@ def field(block: str, label: str) -> str:
             block,
             re.IGNORECASE | re.DOTALL,
         )
+    if not match and label == "titular":
+        match = re.match(r"(.*?)(?=\n\s*[a-z]\s*[.)]|\Z)", block, re.I | re.S)
     return clean_space(match.group(1)) if match else ""
 
 
@@ -81,7 +92,7 @@ def parse(text: str, product_type: ProductType) -> list[ApprovalRecord]:
         if product_type is ProductType.FORMULADO and not fabricante:
             fabricante = field(block, "fabricante")
         cientifico = field(block, "cientifico")
-        nome_biologico = BIOLOGICAL_NAME_RE.search(cientifico) or re.match(
+        nome_biologico = has_biological_product_hint(cientifico) or re.match(
             r"^[^\W\d_]+\s+(?!(?:da|das|de|do|dos|se)\b)[^\W\d_]+", cientifico, re.I
         )
         produto = field(block, "produto")
@@ -95,7 +106,7 @@ def parse(text: str, product_type: ProductType) -> list[ApprovalRecord]:
             produto=produto,
             registro=registro,
             source_index=index,
-            biologico=bool(nome_biologico),
+            biologico=bool(nome_biologico or has_biological_product_hint(produto)),
         )
         tox, amb = field(block, "tox"), field(block, "amb")
         record.nota = " | ".join(part for part in (tox, amb) if part)

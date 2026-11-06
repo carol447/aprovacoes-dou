@@ -6,7 +6,7 @@ from aprovacoes.export import biological_rows, write_xlsx
 from aprovacoes.models import ProductType
 from aprovacoes.parser import detect_product_type, parse
 from aprovacoes.rules import apply_business_rules, normalize_formulated_product, technical_product_without_concentration
-from aprovacoes.stages import _formatted_product
+from aprovacoes.stages import _formatted_product, extract_act, translate_extraction
 from aprovacoes.translations import Translator
 from openpyxl import load_workbook
 import pandas as pd
@@ -39,6 +39,36 @@ k. Classificação quanto ao potencial de periculosidade ambiental: Classe III -
 
 
 class PipelineTests(unittest.TestCase):
+    def test_biological_product_keeps_strength_and_italic_from_html(self):
+        text = FORMULADO.replace("Acefato (750 g/kg)", "<i>Micromus angulatus</i>, isolado ABC 123 (750 g/kg)")
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = extract_act(text, ProductType.FORMULADO, root / "pt.xlsx", download_agrofit=False)
+            self.assertEqual(biological_rows(output, "Produto"), {0})
+            self.assertEqual(pd.read_excel(output).loc[0, "Produto"], "Micromus angulatus 750 g/kg")
+            extract_act(text.replace(" (750 g/kg)", ""), ProductType.FORMULADO, output, download_agrofit=False)
+            dictionary = Path(__file__).resolve().parents[1] / "data" / "dicionario_final.xlsx"
+            _, pending = translate_extraction(output, ProductType.FORMULADO, dictionary, root / "control.xlsx", False)
+            import json
+            result = json.loads(pending.read_text(encoding="utf-8"))
+            self.assertEqual(result["formulados_sem_concentracao"], [])
+            self.assertEqual(result["biologicos_sem_concentracao"][0]["registro"], "00126")
+
+    def test_dou_accepts_double_dash_and_fields_without_colons(self):
+        record = parse(
+            "45--a) Ouro Fino Química Ltda.\n"
+            "b) Marca comercial: IMMEDIATUS\n"
+            "c) Certificado com registro nº 42026\n"
+            "d) Fabricante Ingrediente ativo Bifentrina Técnico. Meghmani Organics Limited.\n"
+            "e) Nome comum Bifentrina.\n"
+            "f) Classificação toxicológica Categoria 4.",
+            ProductType.FORMULADO,
+        )[0]
+        self.assertEqual(record.registrante, "Ouro Fino Química Ltda.")
+        self.assertEqual(record.fabricante, "Bifentrina Técnico. Meghmani Organics Limited.")
+        self.assertEqual(record.produto, "Bifentrina.")
+        self.assertEqual(record.nota, "Categoria 4.")
+
     def test_manufacturer_address_editorial_cleanup(self):
         from aprovacoes.rules import normalize_manufacturer
 
@@ -65,7 +95,7 @@ class PipelineTests(unittest.TestCase):
             "g. Indicação de uso: Indicação de uso: Indicado para as culturas do",
         )
         record = apply_business_rules(parse(text, ProductType.FORMULADO)[0], ProductType.FORMULADO)
-        self.assertEqual(record.produto, "Pseudomonas fluorescens CCT 8242")
+        self.assertEqual(record.produto, "Pseudomonas fluorescens")
         self.assertEqual(record.recomendacao_uso, "Algodão, milho, soja")
         self.assertIn("Fábrica S.A.", record.fabricante)
 
@@ -256,7 +286,7 @@ k) Classificação do potencial de periculosidade ambiental: Classe III - Produt
             "Bacillus velezensis",
         )
 
-    def test_act_58_concentration_from_brand_in_existing_control(self):
+    def test_magazine_preserves_brand_code_without_using_brand_concentrations(self):
         row = pd.Series({
             "produto_pt": "Azoxistrobina + ciproconazol",
             "produto_en": "azoxystrobin + cyproconazole",
@@ -264,17 +294,38 @@ k) Classificação do potencial de periculosidade ambiental: Classe III - Produt
             "marca_comercial": "AZOXYSTROBIN 200 G/L + CYPROCONAZOLE 80 G/L SC SINO-AGRI (32826)",
         })
         for language in ("en", "cn"):
-            self.assertTrue(_formatted_product(row, language, ProductType.FORMULADO).endswith("200 + 80 g/L SC"))
-        row["marca_comercial"] = "AZOXYSTROBIN 280 SC"
-        self.assertNotIn("280", _formatted_product(row, "en", ProductType.FORMULADO))
+            product = _formatted_product(row, language, ProductType.FORMULADO)
+            self.assertTrue(product.endswith("\nSC"))
+            self.assertNotIn("g/L", product)
 
-    def test_brand_only_fills_missing_concentration_and_matches_ingredient_order(self):
+    def test_extract_prefers_dou_and_fills_missing_strengths_from_agrofit(self):
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / "pt.xlsx"
+            csv_path = Path(directory) / "agrofit.csv"
+            csv_path.write_text(
+                'NR_REGISTRO;INGREDIENTE_ATIVO;FORMULACAO\n126;Acefato (800 g/kg) + Clorfenapir (80 g/kg);WG\n',
+                encoding="utf-8",
+            )
+            text = FORMULADO.replace("Acefato (750 g/kg)", "Acefato (750 g/kg); Clorfenapir")
+            extract_act(text, ProductType.FORMULADO, output, csv_path, False)
+            self.assertEqual(pd.read_excel(output).loc[0, "Produto"], "Acefato 750 g/kg + clorfenapir 80 g/kg WG")
+            extract_act(FORMULADO, ProductType.FORMULADO, output, download_agrofit=False)
+            self.assertEqual(pd.read_excel(output).loc[0, "Produto"], "Acefato 750 g/kg")
+            text = FORMULADO.replace("PRODUTO TESTE", "ACEFATO 760 g/kg WG").replace("Acefato (750 g/kg)", "Acefato")
+            extract_act(text, ProductType.FORMULADO, output, csv_path, False)
+            self.assertEqual(pd.read_excel(output).loc[0, "Produto"], "Acefato 760 g/kg WG")
+
+    def test_preserves_stereochemistry_and_formula_without_inventing_strength(self):
+        product = normalize_formulated_product("Acetato de (Z)-9-tetradecenila; (E)-8-dodecenol", "PRODUTO CS")
+        self.assertEqual(product, "Acetato de (Z)-9-tetradecenila + (E)-8-dodecenol CS")
+        translator = Translator(Path(__file__).resolve().parents[1] / "data" / "dicionario_final.xlsx", False)
         self.assertEqual(
-            normalize_formulated_product(
-                "Azoxistrobina 200 g/L + ciproconazol",
-                "CYPROCONAZOLE 80 g/L + AZOXYSTROBIN 210 g/L SC",
-            ),
-            "Azoxistrobina 200 g/L + ciproconazol 80 g/L SC",
+            translator.product(product, "en", ProductType.FORMULADO),
+            "(Z)-9-Tetradecenyl acetate + (E)-8-dodecenol",
+        )
+        self.assertEqual(
+            translator.product("Bacillus velezensis + Priestia aryabhattai", "en", ProductType.FORMULADO),
+            "Bacillus velezensis + Priestia aryabhattai",
         )
 
     def test_strain_cleanup_preserves_scientific_strength_and_next_species(self):
